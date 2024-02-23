@@ -7,14 +7,8 @@ from torch.utils.data import Dataset
 from torch.utils.data import DataLoader
 from trainer_mlp import train
 
-DATA = {
-    "7b": {
-        "c4": "../Decentralized_FM_alpha/ReluLLaMA-7B-c4-data/",
-    },
-}
 
-MODEL_CHOICES = ['7b']
-DATA_CHOICES = ['c4']
+MODEL_CHOICES = ['7b', '13b']
 CONFIG = {
     '7b':{
         'num_layer': 32,
@@ -22,7 +16,15 @@ CONFIG = {
         'd': 4096,
         'f': 11008,
         'h': 32,
-        'N': 400000,
+        'N': 400000,  # 313336
+    },
+    '13b':{
+        'num_layer': 40,
+        'ckt_storage': "bylayer",
+        'd': 5120,
+        'f': 13824,
+        'h': 40,
+        'N': 400000,  # 313336
     },
 }
 
@@ -43,22 +45,23 @@ class BasicDataset(Dataset):
         else:
             x = torch.Tensor(self.X[-idx])
             y = torch.Tensor(self.Y[-idx])
-        if y.sum()== 0:
-            print("all zero y")
-            exit()
+        # if y.sum() == 0:
+        #     print(">>> all zero detected <<<")
         return x, y
+
 
 def get_data(args, l):
     if CONFIG[args.model]['ckt_storage'] == "bylayer":
-        path = f"{DATA[args.model][args.dataset]}/mlp_sp_x_{l}.mmap"
+        path = f"{args.dataset}/mlp_sp_x_{l}.mmap"
         print(f"Reading query from {path}")
-        query = np.array(np.memmap(path, dtype='float16', mode='r', shape=(400000, CONFIG[args.model]['d']))[:CONFIG[args.model]['N']])
+        query = np.array(np.memmap(path, dtype='float16', mode='r', shape=(400000, CONFIG[args.model]['d'])))[:CONFIG[args.model]['N']]
     
-        path = f"{DATA[args.model][args.dataset]}/mlp_label_{l}.mmap"
+        path = f"{args.dataset}/mlp_label_{l}.mmap"
         print(f"Reading MLP label from {path}")
-        label = np.array(np.memmap(path, dtype='float16', mode='r', shape=(400000, CONFIG[args.model]['f']))[:CONFIG[args.model]['N']])
+        label = np.array(np.memmap(path, dtype='float16', mode='r', shape=(400000, CONFIG[args.model]['f'])))[:CONFIG[args.model]['N']]
     
         return  query, label
+
 
 def create_dataset(query, labels, args):
 
@@ -82,7 +85,8 @@ def create_dataset(query, labels, args):
 def main():
     parser = argparse.ArgumentParser(description="PyTorch OPT Full Model")
     parser.add_argument("--model", type=str, default="7b", choices = MODEL_CHOICES)
-    parser.add_argument("--dataset", type=str, default="c4", choices = DATA_CHOICES)
+    parser.add_argument("--dataset", type=str, required=True)
+    parser.add_argument("--model_name", type=str, required=True)
     parser.add_argument(
         "--L",
         type=int,
@@ -120,7 +124,7 @@ def main():
     torch.manual_seed(0)
     np.random.seed(0)
 
-    device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    device = "cuda"
 
     print("=" * 40, "Layer", args.L, "=" * 40)
 
@@ -130,25 +134,24 @@ def main():
 
     query_layer = torch.nn.Sequential(
         torch.nn.Linear(CONFIG[args.model]['d'], args.D, bias=None),
+        torch.nn.ReLU(),
         torch.nn.Linear(args.D, CONFIG[args.model]['f'], bias=None),
     )
-
-    states = torch.load("/home/jeeves/ReluLLaMA-7B-Predictor/model_0.pt")
-    states = {"0.weight": states["fc1.weight"], "1.weight": states["fc2.weight"]}
-    query_layer.load_state_dict(states)
 
     print("Start Training")
     best_model, eval_result = train(
         query_layer,  train_loader, test_loader, args, device, verbal=True
     )
 
-    file_name = f"{args.dataset}_layer{args.L}_-{eval_result['Recall']:.4f}-{eval_result['Classifier Sparsity']:.0f}.pt"
-    path = f"checkpoints/{file_name}"
-    new_best_model = {"fc1.weight": best_model["0.weight"], "fc2.weight": best_model["1.weight"]}
+    file_name = f"layer{args.L}-{eval_result['Recall']:.4f}-{eval_result['Classifier Sparsity']:.0f}.pt"
+    model_path = os.path.join("checkpoints", args.model_name)
+    os.makedirs(model_path, exist_ok=True)
+    path = f"{model_path}/{file_name}"
+    new_best_model = {"fc1.weight": best_model["0.weight"], "fc2.weight": best_model["2.weight"]}
     torch.save(new_best_model, path)
-    if os.path.exists(f"model_{args.L}.pt"):
-        os.system(f"rm checkpoints/model_{args.L}.pt")
-    os.system(f"ln -s {file_name} checkpoints/model_{args.L}.pt")
+    if os.path.exists(f"{model_path}/model_{args.L}.pt"):
+        os.system(f"rm {model_path}/model_{args.L}.pt")
+    os.system(f"ln -s {file_name} {model_path}/model_{args.L}.pt")
 
 
 if __name__ == "__main__":

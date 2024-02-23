@@ -31,8 +31,6 @@ from torch.nn import CrossEntropyLoss
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.modeling_attn_mask_utils import (
-    AttentionMaskConverter,
-    _prepare_4d_attention_mask,
     _prepare_4d_causal_attention_mask,
     _prepare_4d_causal_attention_mask_for_sdpa,
 )
@@ -54,6 +52,7 @@ class ActivationRecorder:
 
     record_flag: bool = False
     record_path: str = "ReluLLaMA-7B-c4-data"
+    attn_flag: bool = False
 
     @classmethod
     def set_record_flag(cls, flag: bool):
@@ -63,48 +62,54 @@ class ActivationRecorder:
     def set_record_path(cls, path: str):
         cls.record_path = path
 
+    @classmethod
+    def set_attn_flag(cls, flag: bool):
+        cls.attn_flag = flag
+
     def __init__(self, config: LlamaConfig, layer_idx: int):
         self.layer_idx = layer_idx
         self.num_heads = config.num_attention_heads
 
-        self.fp_mlp_query = np.memmap(
-            f"{self.record_path}/mlp_sp_x_{layer_idx}.mmap",
-            dtype="float16",
-            mode="w+",
-            shape=(
-                400000,
-                config.hidden_size,
-            ),
-        )
-        self.fp_mlp_label = np.memmap(
-            f"{self.record_path}/mlp_label_{layer_idx}.mmap",
-            dtype="float16",
-            mode="w+",
-            shape=(
-                400000,
-                config.intermediate_size,
-            ),
-        )
+        if self.record_flag:
+            self.fp_mlp_query = np.memmap(
+                f"{self.record_path}/mlp_sp_x_{layer_idx}.mmap",
+                dtype="float16",
+                mode="w+",
+                shape=(
+                    400000,
+                    config.hidden_size,
+                ),
+            )
+            self.fp_mlp_label = np.memmap(
+                f"{self.record_path}/mlp_label_{layer_idx}.mmap",
+                dtype="float16",
+                mode="w+",
+                shape=(
+                    400000,
+                    config.intermediate_size,
+                ),
+            )
         self.fp_mlp_id = 0
 
-        self.fp_att_query = np.memmap(
-            f"{self.record_path}/att_sp_x_{layer_idx}.mmap",
-            dtype="float16",
-            mode="w+",
-            shape=(
-                400000,
-                config.hidden_size,
-            ),
-        )
-        self.fp_att_label = np.memmap(
-            f"{self.record_path}/score_norm_{layer_idx}.mmap",
-            dtype="float16",
-            mode="w+",
-            shape=(
-                400000,
-                config.num_attention_heads,
-            ),
-        )
+        if self.record_flag and self.attn_flag:
+            self.fp_att_query = np.memmap(
+                f"{self.record_path}/att_sp_x_{layer_idx}.mmap",
+                dtype="float16",
+                mode="w+",
+                shape=(
+                    400000,
+                    config.hidden_size,
+                ),
+            )
+            self.fp_att_label = np.memmap(
+                f"{self.record_path}/score_norm_{layer_idx}.mmap",
+                dtype="float16",
+                mode="w+",
+                shape=(
+                    400000,
+                    config.num_attention_heads,
+                ),
+            )
         self.fp_att_id = 0
 
     def record_fp_mlp_query(self, hidden_states, mask_1d):
@@ -131,7 +136,12 @@ class ActivationRecorder:
         assert seq_len <= mask_1d.shape[1]
         if mask_1d.shape[1] > seq_len:
             mask_1d = mask_1d[:, -seq_len:]
-        up_proj = up_proj.half()
+        up_proj = torch.abs(up_proj.half())
+        remain_num = int(0.15 * up_proj.shape[-1])
+        values, indices = torch.topk(up_proj, k=remain_num, dim=-1)
+        new_up_proj = torch.zeros_like(up_proj)
+        new_up_proj.scatter_(2, indices, values)
+        up_proj = new_up_proj
         if self.record_flag and self.fp_mlp_id < self.fp_mlp_label.shape[0]:
             label = up_proj.view(-1, up_proj.size(-1))[mask_1d.bool().view(-1)]
             begin, end = self.fp_mlp_id, min(
@@ -141,13 +151,15 @@ class ActivationRecorder:
             self.fp_mlp_id += label.size(0)
 
     def record_fp_att_query(self, hidden_states, mask_1d):
+        if not self.attn_flag:
+            return
         batch_size, seq_len = hidden_states.shape[:2]
         assert batch_size == mask_1d.shape[0]
         assert seq_len <= mask_1d.shape[1]
         if mask_1d.shape[1] > seq_len:
             mask_1d = mask_1d[:, -seq_len:]
         hidden_states = hidden_states.half()
-        if self.fp_att_id < self.fp_att_query.shape[0]:
+        if self.record_flag and self.fp_att_id < self.fp_att_query.shape[0]:
             _hidden_states = hidden_states.view(-1, hidden_states.size(-1))[
                 mask_1d.bool().view(-1)
             ]
@@ -159,13 +171,15 @@ class ActivationRecorder:
             )
 
     def record_fp_att_label(self, attn_output, mask_1d):
+        if not self.attn_flag:
+            return
         batch_size, _, seq_len = attn_output.shape[:3]
         assert batch_size == mask_1d.shape[0]
         assert seq_len <= mask_1d.shape[1]
         if mask_1d.shape[1] > seq_len:
             mask_1d = mask_1d[:, -seq_len:]
         attn_output = attn_output.half()
-        if self.fp_att_id < self.fp_att_label.shape[0]:
+        if self.record_flag and self.fp_att_id < self.fp_att_label.shape[0]:
             attn_output_norm = attn_output.norm(dim=-1)
             attn_output_norm = attn_output_norm.transpose(2, 1).view(
                 -1, self.num_heads
@@ -180,7 +194,7 @@ class ActivationRecorder:
             self.fp_att_id += attn_output_norm.size(0)
 
     def check_id_ok(self):
-        assert self.fp_mlp_id == self.fp_att_id, f"{self.fp_mlp_id} | {self.fp_att_id}"
+        assert not self.attn_flag or self.fp_mlp_id == self.fp_att_id, f"{self.fp_mlp_id} | {self.fp_att_id}"
 
 
 ACTIVATION_RECORDERS: List[ActivationRecorder] = []
@@ -345,7 +359,21 @@ class LlamaMLP(nn.Module):
         self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
-        self.act_fn = ACT2FN[config.hidden_act]
+        if config.hidden_act in ACT2FN:
+            self.act_fn = ACT2FN[config.hidden_act]
+        elif config.hidden_act.startswith("fatrelu"):
+            _, threshold = config.hidden_act.split("_")
+            threshold = float(threshold)
+
+            def fat_relu(x):
+                new_x = torch.zeros_like(x)
+                mask = torch.ge(x, threshold)
+                new_x[mask] = x[mask]
+                return new_x
+
+            self.act_fn = fat_relu
+        else:
+            raise NotImplementedError(f"invalid hidden_act: {config.hidden_act}")
         self.layer_idx = layer_idx
 
     def forward(self, x, mask_1d):
